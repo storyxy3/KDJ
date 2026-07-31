@@ -253,17 +253,15 @@ fn onsets_per_beat(env: &[f64], fps: f64, bpm: f64) -> f64 {
 /// 4:3 提升：主峰常是「每三拍一组」的慢网格，真四分在 4/3 倍。
 ///
 /// Our Chant：raw 92、次峰 184（2×）、第三峰 123（4/3）；梳状分 123 最高 → 123。
-/// 只有当 4/3 峰的梳状分不弱于 raw **且不弱于 2×** 才升，避免和真倍速抢。
+/// 昊天 -koten-：raw 129.5、第 4 峰 172（=4/3），梳状 172 比 129 高约 1.4× → 172；
+/// 而 Sky High 128 的 171 峰梳状更弱（或仅略强），不能跟着抬。
+/// 只有当 4/3 峰的梳状分相对 raw（及 2×）够强才升。
 fn promote_four_three(
     env: &[f64],
     fps: f64,
     bpm_raw: f64,
     candidates: &[f64],
 ) -> Option<f64> {
-    // 只修「主峰偏慢」：raw 已在常见舞曲区就别再抬（Sky High 128 不该→172）。
-    if bpm_raw >= 110.0 {
-        return None;
-    }
     let mid = find_ratio_peak(bpm_raw, candidates, 1.28, 1.40)?;
     // 起音过密（每拍 >1.4 个峰）是典型「高速曲被听成半速」：交给 2×，
     // 不让差一点的 4:3 峰（VICTORY 的 127）截胡真 2×（188）。
@@ -272,7 +270,10 @@ fn promote_four_three(
     }
     let raw_score = comb_score(env, 60.0 * fps / bpm_raw);
     let mid_score = comb_score(env, 60.0 * fps / mid);
-    if mid_score < raw_score {
+    // raw 已在常见舞曲区（≥110）时更谨慎：Sky High / Sky High pt.II 的 171 峰
+    // 梳状最多略强（约 ×1.24），绝不能抬；昊天 129→172 则到 ×1.43。
+    let min_ratio = if bpm_raw >= 110.0 { 1.30 } else { 1.0 };
+    if mid_score < raw_score * min_ratio {
         return None;
     }
     if let Some(double) = find_double_peak(bpm_raw, candidates) {
@@ -857,6 +858,35 @@ mod tests {
             promote_four_three(&env, fps, 92.4, &[92.4, 184.5, 123.1, 61.6]),
             Some(123.1),
             "Our Chant 类应选 4:3 而不是 2×"
+        );
+
+        // 昊天 -koten- 形状：主峰 129.5，真拍 172（=4/3）。
+        // raw≥110 以前被一刀切禁掉；现在要求梳状明显偏好 4/3。
+        let mut koten = vec![0.0f64; 4000];
+        let true_period = 60.0 * fps / 172.3;
+        let mut pos = 0.0_f64;
+        while (pos as usize) + 1 < koten.len() {
+            koten[pos.round() as usize] = 1.0;
+            pos += true_period;
+        }
+        assert_eq!(
+            promote_four_three(&koten, fps, 129.5, &[129.5, 86.4, 64.8, 172.3, 103.4]),
+            Some(172.3),
+            "昊天类 129 主峰应抬到 172"
+        );
+
+        // Sky High 形状：真 128，4/3 峰 171 梳状更弱，不得抬。
+        let mut sky = vec![0.0f64; 4000];
+        let sky_period = 60.0 * fps / 128.5;
+        let mut pos = 0.0_f64;
+        while (pos as usize) + 1 < sky.len() {
+            sky[pos.round() as usize] = 1.0;
+            pos += sky_period;
+        }
+        assert_eq!(
+            promote_four_three(&sky, fps, 128.5, &[128.5, 85.7, 64.2, 171.3, 103.2]),
+            None,
+            "Sky High 128 不该被抬到 171"
         );
     }
 
