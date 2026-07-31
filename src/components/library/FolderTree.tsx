@@ -911,11 +911,31 @@ export function FolderTree({
                 offset += page.items.length;
                 if (page.items.length === 0 || offset >= page.total) break;
               }
+              // 只排还没分析过的；已分析的不会进队（force=false）。
               await startAnalyze(ids, false);
             })().catch((error: unknown) => setNotice((error as Error).message));
           }}>
             <BarChart3 size={12} />
-            分析此文件夹
+            分析未分析曲目
+          </button>
+          <button type="button" onClick={() => {
+            const folder = menu.node.path;
+            setMenu(null);
+            void (async () => {
+              const ids: number[] = [];
+              let offset = 0;
+              while (true) {
+                const page = await api.tracks({ folder, folder_deep: 1, limit: 1000, offset });
+                ids.push(...page.items.map((track) => track.id));
+                offset += page.items.length;
+                if (page.items.length === 0 || offset >= page.total) break;
+              }
+              // force=true：覆盖已有 BPM/调号。自动分析结束后想重算就靠这个。
+              await startAnalyze(ids, true);
+            })().catch((error: unknown) => setNotice((error as Error).message));
+          }}>
+            <BarChart3 size={12} />
+            重新分析此文件夹
           </button>
           <button
             type="button"

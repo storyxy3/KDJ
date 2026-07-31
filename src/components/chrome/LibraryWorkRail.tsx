@@ -122,6 +122,7 @@ export function LibraryWorkRail({
   const selectionMode = useLibraryStore((state) => state.selectionMode);
   const setSelectionMode = useLibraryStore((state) => state.setSelectionMode);
   const copyToClipboard = useLibraryStore((state) => state.copyToClipboard);
+  const startAnalyze = useLibraryStore((state) => state.startAnalyze);
   const activeDownloads = useDownloadStore((state) => state.activeCount);
   const downloadList = useDownloadStore((state) => state.list);
   const running = downloadList.find((task) => task.state === "running");
@@ -442,6 +443,27 @@ export function LibraryWorkRail({
       </span>,
     );
   }
+
+  // 自动分析只会挑 analyzed_at IS NULL；BPM 算法升级后，已分析的歌必须靠 force 才能重算。
+  // 右键菜单已有单首「重新分析」，这里补上「全部」入口——注释里写了很久，UI 一直缺。
+  texts.push(
+    <button
+      key="reanalyze-all"
+      type="button"
+      className="kd-activity-control"
+      disabled={analyze !== null || (stats?.total ?? total) === 0}
+      title="强制重新分析曲库全部曲目（覆盖已有 BPM / 调号）。大曲库可能要几十分钟。"
+      onClick={() => {
+        useLibraryStore.getState().setAutoAnalyzeSuspended(false);
+        void startAnalyze(null, true, false).catch(() => {
+          /* 失败时进度条不会挂起；用户可再点一次 */
+        });
+      }}
+    >
+      <BarChart3 size={11} />
+      重新分析全部
+    </button>,
+  );
 
   texts.push(
     <button

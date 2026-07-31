@@ -550,6 +550,25 @@ export function TrackDetail({ track }: { track: Track }) {
           首拍 {track.first_beat !== null ? `${track.first_beat.toFixed(3)}s` : DASH}
           <span className="kd-toolbar-gap" />
           {track.analyzed_at ? `分析于 ${formatDate(track.analyzed_at)}` : "未分析"}
+          <span className="kd-toolbar-gap" />
+          <button
+            type="button"
+            className="kd-btn"
+            data-variant="ghost"
+            data-size="sm"
+            title={track.analyzed_at ? "强制重新分析，覆盖现有 BPM / 调号" : "开始分析"}
+            onClick={() => {
+              void useLibraryStore
+                .getState()
+                .startAnalyze([track.id], Boolean(track.analyzed_at), true)
+                .catch((error: unknown) =>
+                  setNotice(`分析失败：${error instanceof Error ? error.message : String(error)}`),
+                );
+            }}
+          >
+            <RotateCcw size={12} />
+            {track.analyzed_at ? "重新分析" : "分析"}
+          </button>
         </div>
         {track.analysis_error && (
           <p style={{ color: "var(--kd-warn)", marginTop: "0.4rem" }}>{track.analysis_error}</p>
