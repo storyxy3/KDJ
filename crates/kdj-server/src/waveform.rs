@@ -18,10 +18,11 @@ use crate::jobs;
 
 /// 播放条 / 详情栏默认要的列数。分析预热也写这一档。
 pub const DEFAULT_WAVEFORM_BUCKETS: usize = 640;
-pub const CANONICAL_WAVEFORM_PROFILE: &str = "kdwave-v1-640";
-pub const CANONICAL_WAVEFORM_REVISION: i64 = 1;
+/// Mixxx 式 IIR 三分频（600/4000 Hz）+ 峰值 RGB；升版本逼旧缓存重算。
+pub const CANONICAL_WAVEFORM_PROFILE: &str = "kdwave-v2-mixxx-640";
+pub const CANONICAL_WAVEFORM_REVISION: i64 = 2;
 const CACHE_MAGIC: &[u8; 8] = b"KDJWAVE\0";
-const CACHE_VERSION: u16 = 1;
+const CACHE_VERSION: u16 = 2;
 const CACHE_HEADER_LEN: usize = 8 + 2 + 8 + 8 + 4;
 const MAX_CACHE_COLUMNS: usize = 100_000;
 
@@ -412,11 +413,8 @@ pub fn file_mtime(path: &Path) -> u64 {
 }
 
 fn cache_path(cache_dir: &Path, track_id: i64, buckets: usize, mtime: u64) -> PathBuf {
-    cache_dir.join(format!("{track_id}-v3-{buckets}-{mtime}.kdwave"))
-}
-
-fn legacy_cache_path(cache_dir: &Path, track_id: i64, buckets: usize, mtime: u64) -> PathBuf {
-    cache_dir.join(format!("{track_id}-v2-{buckets}-{mtime}.json"))
+    // v4：算法切到 Mixxx IIR 三分频；旧 v3 文件即使魔数能读也是另一套颜色，文件名直接换掉。
+    cache_dir.join(format!("{track_id}-v4-{buckets}-{mtime}.kdwave"))
 }
 
 fn read_cache(path: &Path) -> Option<Waveform> {
@@ -458,29 +456,12 @@ fn read_cache(path: &Path) -> Option<Waveform> {
     })
 }
 
-fn read_legacy_cache(path: &Path) -> Option<Waveform> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let wave: Waveform = serde_json::from_str(&text).ok()?;
-    encode_cache(&wave).ok()?;
-    Some(wave)
-}
-
-/// 旧 JSON 通过结构校验后直接转成 `.kdwave`，不重新解码音频。只有新文件写完并
-/// 重新读回成功才删除旧文件；转换写失败时仍返回旧波形，播放不受迁移影响。
 fn read_cached(cache_dir: &Path, key: WaveKey) -> Option<(Waveform, bool)> {
     let current = cache_path(cache_dir, key.track_id, key.buckets, key.mtime);
-    if let Some(wave) = read_cache(&current).filter(|wave| wave.track_id == key.track_id) {
-        return Some((wave, true));
-    }
-    let legacy = legacy_cache_path(cache_dir, key.track_id, key.buckets, key.mtime);
-    let wave = read_legacy_cache(&legacy).filter(|wave| wave.track_id == key.track_id)?;
-    let canonical = write_cache(&current, &wave).is_ok()
-        && read_cache(&current)
-            .is_some_and(|saved| saved.track_id == key.track_id);
-    if canonical {
-        let _ = std::fs::remove_file(legacy);
-    }
-    Some((wave, canonical))
+    let wave = read_cache(&current).filter(|wave| wave.track_id == key.track_id)?;
+    // 算法从 Serato/STFT 切到 Mixxx/IIR 后，旧 JSON / v3 缓存不再迁移——颜色语义已变，
+    // 硬搬只会画出一套过期配色；未命中就重新解码。
+    Some((wave, true))
 }
 
 #[cfg(test)]
@@ -546,14 +527,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_is_converted_without_decoding_audio() {
-        let dir = scratch("legacy");
+    fn stale_algorithm_cache_is_ignored() {
+        let dir = scratch("stale");
         let key = WaveKey {
             track_id: 7,
             buckets: 640,
             mtime: 99,
         };
-        let old = legacy_cache_path(&dir, key.track_id, key.buckets, key.mtime);
+        // 旧版 JSON / 错误版本号都不能当命中——否则会画出 Serato 旧配色。
+        let legacy_json = dir.join(format!(
+            "{}-v2-{}-{}.json",
+            key.track_id, key.buckets, key.mtime
+        ));
         let wave = Waveform {
             track_id: 7,
             duration: 8.0,
@@ -562,15 +547,24 @@ mod tests {
             g: vec![3, 4],
             b: vec![5, 6],
         };
-        std::fs::write(&old, serde_json::to_vec(&wave).unwrap()).unwrap();
+        std::fs::write(&legacy_json, serde_json::to_vec(&wave).unwrap()).unwrap();
+        assert!(read_cached(&dir, key).is_none());
 
-        let (loaded, canonical) = read_cached(&dir, key).unwrap();
-        assert!(canonical);
-        assert_eq!(loaded.amp, wave.amp);
+        let mut body = Vec::new();
+        body.extend_from_slice(CACHE_MAGIC);
+        body.extend_from_slice(&1u16.to_le_bytes()); // 旧 CACHE_VERSION
+        body.extend_from_slice(&key.track_id.to_le_bytes());
+        body.extend_from_slice(&8.0f64.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for value in &wave.amp {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&wave.r);
+        body.extend_from_slice(&wave.g);
+        body.extend_from_slice(&wave.b);
         let current = cache_path(&dir, key.track_id, key.buckets, key.mtime);
-        assert!(current.is_file());
-        assert!(read_cache(&current).is_some());
-        assert!(!old.exists(), "新二进制重新校验成功后才清理旧 JSON");
+        std::fs::write(&current, body).unwrap();
+        assert!(read_cached(&dir, key).is_none(), "旧算法版本必须重算");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

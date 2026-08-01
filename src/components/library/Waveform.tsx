@@ -13,10 +13,10 @@ export interface SeekDetail {
 }
 
 /**
- * Serato / Rekordbox 那种彩色波形。
+ * Mixxx / Serato 那种彩色波形。
  *
- * 模型来自 libdjwaveform：**一列 = 一根柱子**，高度是这一列的响度，
- * 颜色是这一列的频谱构成（红=低频鼓组、绿=中频人声、蓝=高频镲片）。
+ * 模型对齐 Mixxx AnalyzerWaveform：**一列 = 一根柱子**，高度是全带峰值，
+ * 颜色是低/中/高三分频合成（红/绿/蓝）。
  * 后端 `/api/library/waveform` 已经把每列的 amp + rgb 算好，这里只负责画。
  *
  * 用 canvas 而不是 SVG：几百到上千根柱子如果各是一个 <rect>，

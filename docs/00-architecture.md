@@ -392,8 +392,8 @@ U 盘、要用 Rekordbox / Serato 再读一遍，虚拟分组到那一步就没�
 
 ## 10. 彩色波形（`app.py::_band_waveform`）
 
-模型来自 libdjwaveform / Serato：**一列 = 一根柱子，高度是响度，颜色是频谱构成**。
-Serato 的交叉点：红↔绿 ≈ 200 Hz，绿↔蓝 ≈ 1.5 kHz。
+模型对齐 Mixxx `AnalyzerWaveform`：**一列 = 一根柱子，高度是全带峰值，颜色是三分频合成**。
+交叉点与 Mixxx 相同：红↔绿 = 600 Hz，绿↔蓝 = 4 kHz（时域 IIR，非 STFT）。
 
 高度取三段功率之和开根号，再做 P5–P99 对比拉伸（只除 P99 的话，压过的母带整首
 挤在 0.6~1.0，画出来是一条实心带）。

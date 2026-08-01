@@ -1,61 +1,51 @@
-//! Serato 式彩色波形：**每一列一根柱子**，高度 = 响度，颜色 = 这一列的频谱构成。
+//! Mixxx 式 RGB 波形：**每一列一根柱子**，高度 = 全带峰值，颜色 = 三分频合成。
 //!
-//! 做法照搬 libdjwaveform / Serato 的模型：STFT 之后，一帧（一列）先算出
-//! 低/中/高三段的能量，高度取三段之和，颜色取三段的**相对占比**。
+//! 对照 [mixxxdj/mixxx](https://github.com/mixxxdj/mixxx) 的 `AnalyzerWaveform`：
+//! - 时域 IIR 三分频（Mixxx 用 Bessel4；这里用二阶 Butterworth 双二阶，交叉点同为
+//!   **600 Hz / 4000 Hz**——见 `analyzerwaveform.cpp` 的 `kLowMidFreqHz` /
+//!   `kMidHighFreqHz`）
+//! - 每个显示格取 `|x|` **峰值**（不是 STFT 功率、也不是均值）
+//! - 颜色与 `WaveformRendererRGB` 一致：`RGB = Σ band·primary`，再按最大分量归一
+//!   （默认 low=红 mid=绿 high=蓝）
 //!
-//! 波形单开一条路径而不是塞进分析结果：它是纯展示用的，
-//! 既不影响 BPM/调性，也不该逼用户为了看波形去重跑一次分析。
+//! 高度仍做 P5→P99 对比拉伸：Mixxx 是把 0..1 样本直接 ×255 存库、渲染时再乘
+//! gain；我们的前端直接吃 0..1 的 `amp`，母带压扁的曲子不拉伸会变成一条实心带。
+//!
+//! 波形单开一条路径：纯展示，不影响 BPM/调性，也不逼用户为了看波形重跑分析。
 
 use kdj_core::models::Waveform;
 
-use crate::dsp::{self, percentile};
+use crate::dsp::percentile;
 
-/// 16 kHz：奈奎斯特 8 kHz，高频段还留得住镲和空气感；
-/// 再高就只是让解码和 STFT 变慢，对一条几百像素宽的波形没有意义。
+/// 16 kHz：奈奎斯特 8 kHz，盖住 4 kHz 高通交叉点还有一倍余量；
+/// 再高只是让解码变慢，对几百像素宽的总览波形没有意义。
 pub const WAVEFORM_SR: u32 = 16000;
-const N_FFT: usize = 1024;
-const HOP: usize = 512;
-/// Serato 的三色交叉点（社区实测）：红↔绿 ≈ 200 Hz，绿↔蓝 ≈ 1.5 kHz。
-/// 2.5 kHz 试过，人声段会被算成"高频"而发蓝，1.5 kHz 才把人声留在绿区。
-const XOVER_LOW: f64 = 200.0;
-const XOVER_HIGH: f64 = 1500.0;
+
+/// Mixxx `AnalyzerWaveform` 交叉点（`analyzerwaveform.cpp`）。
+const XOVER_LOW_MID_HZ: f64 = 600.0;
+const XOVER_MID_HIGH_HZ: f64 = 4000.0;
+
 const AMP_GAMMA: f64 = 1.2;
-/// γ 很大是必须的：占比的偏离量本身很小（0.45 → 0.50 这种级别），
-/// γ=2 出来是一片淡彩，γ=6 才是 DJ 软件里那种能一眼分辨段落的饱和色。
-const COLOR_GAMMA: f64 = 6.0;
-/// 通道下限：纯 (255,0,0) 在深色底上太扎眼，抬一点让暗通道保留一丝底色。
+/// 通道下限：纯 (255,0,0) 在深色底上太扎眼，抬一点让暗通道留一丝底色。
 const COLOR_FLOOR: f64 = 0.12;
+
+/// 稳定后再取峰值，跳过 IIR 起振（Mixxx 用 `assumeSettled()` 预热静音）。
+const SETTLE_SECONDS: f64 = 0.05;
 
 pub fn band_waveform(samples: &[f32], sr: f64, buckets: usize) -> Waveform {
     let buckets = buckets.clamp(64, 2000);
-    // center=false：波形要的是“第 n 段音频长什么样”，不需要和拍点对齐。
-    // FFT 每出来一帧就归并成低/中/高三个数，不再保留 bins × frames 的完整频谱。
-    let energies = band_energy_frames(samples, sr, N_FFT, HOP);
-    let n_frames = energies[0].len();
-    if n_frames == 0 {
+    if samples.len() < 32 || sr <= 0.0 {
         return Waveform::default();
     }
 
-    // 帧 → 显示格。尾巴不足一格的直接截掉，补零会画出一根假的静音柱。
-    let step = (n_frames / buckets).max(1);
-    let count = n_frames / step;
+    let (all, low, mid, high) = filter_peak_buckets(samples, sr, buckets);
+    let count = all.len();
     if count == 0 {
         return Waveform::default();
     }
-    let mut bands = [vec![0.0f64; count], vec![0.0f64; count], vec![0.0f64; count]];
-    for (band, source) in bands.iter_mut().zip(&energies) {
-        for (index, slot) in band.iter_mut().enumerate() {
-            let start = index * step;
-            *slot = source[start..start + step].iter().sum::<f64>() / step as f64;
-        }
-    }
 
-    // ---- 高度：三段功率之和开根号（= 幅度），再做百分位对比拉伸。
-    // 只除以 P99 是不够的：现代母带压完之后整首的 RMS 都挤在 0.6~1.0，
-    // 画出来就是一条实心带。把 P5 当作"地板"减掉，起伏才回得来。
-    let mut amp: Vec<f64> = (0..count)
-        .map(|i| (bands[0][i] + bands[1][i] + bands[2][i]).sqrt())
-        .collect();
+    // ---- 高度：全带峰值 + 百分位对比拉伸（P5 地板 / P99 顶）
+    let mut amp = all;
     let mut sorted = amp.clone();
     sorted.sort_by(f64::total_cmp);
     let hi = {
@@ -68,74 +58,30 @@ pub fn band_waveform(samples: &[f32], sr: f64, buckets: usize) -> Waveform {
     };
     let lo = percentile(&sorted, 5.0);
     for value in amp.iter_mut() {
-        *value = ((*value - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0).powf(AMP_GAMMA);
+        *value = ((*value - lo) / (hi - lo).max(1e-9))
+            .clamp(0.0, 1.0)
+            .powf(AMP_GAMMA);
     }
 
-    // ---- 颜色：这一列的频谱**占比**，相对全曲常态的偏离量。
-    //
-    // 试过三种，前两种都不行：
-    //   A. 三段幅度用同一个尺度直接当 RGB——中频带宽最宽、能量天然最大，
-    //      每列的最大通道永远是绿，整首绿成一片。
-    //   B. 三段各按自己的 P95 归一——三段的响度是高度相关的（一起大声一起小声），
-    //      归一后每列三通道都接近 1，整首发白。
-    //   C. 先把每列化成"低/中/高各占多少"（除掉共同的响度），再和全曲的常态
-    //      占比相比——只有比常态更强的频段才亮。鼓点段红、人声段绿、镲密的段蓝。
-    //
-    // 代价：颜色是**相对本曲**的，两首曲子的同一个颜色不代表同样的绝对频谱。
-    // 但波形是拿来看单曲结构的，段落之间分得开比跨曲可比更有用。
-    let mut mag: [Vec<f64>; 3] = [
-        bands[0].iter().map(|v| v.sqrt()).collect(),
-        bands[1].iter().map(|v| v.sqrt()).collect(),
-        bands[2].iter().map(|v| v.sqrt()).collect(),
-    ];
-
-    // 配色前先沿时间轴做滑动平均：一格才 200~300 ms，底鼓和踩镲会逐格交替，
-    // 不平滑的话每根柱子颜色都跳，画出来是彩色噪点。
-    // 高度不参与平滑——瞬态该锐就得锐。
-    let span = ((count / 128).max(3)) | 1;
-    if count > span {
-        for row in mag.iter_mut() {
-            *row = dsp::moving_average(row, span);
-        }
-    }
-
-    let share: [Vec<f64>; 3] = {
-        let mut out = [vec![0.0; count], vec![0.0; count], vec![0.0; count]];
-        for i in 0..count {
-            let total = (mag[0][i] + mag[1][i] + mag[2][i]).max(1e-12);
-            for band in 0..3 {
-                out[band][i] = mag[band][i] / total;
-            }
-        }
-        out
-    };
-
-    // 用中位数而不是均值：几个特别猛的低频瞬态会把均值拉高，常态就跑偏了
-    let reference: [f64; 3] = std::array::from_fn(|band| {
-        let mut values = share[band].clone();
-        let value = dsp::median(&mut values);
-        if value <= 0.0 {
-            1.0
-        } else {
-            value
-        }
-    });
-
+    // ---- 颜色：Mixxx RGB = low·R + mid·G + high·B，再 / max(分量)
+    // 默认 primary 就是单位矩阵，化简为直接用三段峰值当 RGB 再归一。
+    // 与旧 Serato「相对本曲占比」不同：这里跨曲同一颜色更接近同一绝对频谱。
     let mut r = vec![0u8; count];
     let mut g = vec![0u8; count];
     let mut b = vec![0u8; count];
     for i in 0..count {
-        let dev: [f64; 3] =
-            std::array::from_fn(|band| (share[band][i] / reference[band]).powf(COLOR_GAMMA));
-        let peak = dev.iter().cloned().fold(0.0f64, f64::max).max(1e-9);
-        let channels: [u8; 3] = std::array::from_fn(|band| {
-            let normalized = (dev[band] / peak).clamp(0.0, 1.0);
-            let lifted = COLOR_FLOOR + (1.0 - COLOR_FLOOR) * normalized;
-            (lifted * 255.0).round() as u8
-        });
-        r[i] = channels[0];
-        g[i] = channels[1];
-        b[i] = channels[2];
+        let mut red = low[i];
+        let mut green = mid[i];
+        let mut blue = high[i];
+        let peak = red.max(green).max(blue);
+        if peak > 0.0 {
+            red /= peak;
+            green /= peak;
+            blue /= peak;
+        }
+        r[i] = to_u8(red);
+        g[i] = to_u8(green);
+        b[i] = to_u8(blue);
     }
 
     Waveform {
@@ -151,54 +97,134 @@ pub fn band_waveform(samples: &[f32], sr: f64, buckets: usize) -> Waveform {
     }
 }
 
-/// `center = false` 的逐帧 STFT。只保留每帧三频段功率：5 分钟音频原先要分配
-/// 约 `513 × 9,000` 个频谱值，现在只保留 `3 × 9,000` 个 f64。
-fn band_energy_frames(
+fn to_u8(channel: f64) -> u8 {
+    let lifted = COLOR_FLOOR + (1.0 - COLOR_FLOOR) * channel.clamp(0.0, 1.0);
+    (lifted * 255.0).round() as u8
+}
+
+/// 时域三分频后，按显示格取 |x| 峰值。返回 (all, low, mid, high)。
+fn filter_peak_buckets(
     samples: &[f32],
     sr: f64,
-    n_fft: usize,
-    hop: usize,
-) -> [Vec<f64>; 3] {
-    use rustfft::num_complex::Complex32;
-    use rustfft::FftPlanner;
-
-    if samples.len() < n_fft {
+    buckets: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let n = samples.len();
+    let step = (n / buckets).max(1);
+    let count = n / step;
+    if count == 0 {
         return Default::default();
     }
-    let bins = n_fft / 2 + 1;
-    let frames = 1 + (samples.len() - n_fft) / hop;
-    let window = dsp::hann_window(n_fft);
-    let mut energies = [
-        vec![0.0f64; frames],
-        vec![0.0f64; frames],
-        vec![0.0f64; frames],
-    ];
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n_fft);
-    let mut scratch = vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
-    let mut buffer = vec![Complex32::new(0.0, 0.0); n_fft];
+    // 两级串联逼近 4 阶（Mixxx Bessel4）；可视化对相位不敏感，Butterworth 够用。
+    let mut low_a = Biquad::lowpass(sr, XOVER_LOW_MID_HZ, 0.7071);
+    let mut low_b = Biquad::lowpass(sr, XOVER_LOW_MID_HZ, 0.7071);
+    let mut high_a = Biquad::highpass(sr, XOVER_MID_HIGH_HZ, 0.7071);
+    let mut high_b = Biquad::highpass(sr, XOVER_MID_HIGH_HZ, 0.7071);
+    // 带通 = 高通(低交叉) → 低通(高交叉)，与 Mixxx band 滤波器同交叉点。
+    let mut mid_hp_a = Biquad::highpass(sr, XOVER_LOW_MID_HZ, 0.7071);
+    let mut mid_hp_b = Biquad::highpass(sr, XOVER_LOW_MID_HZ, 0.7071);
+    let mut mid_lp_a = Biquad::lowpass(sr, XOVER_MID_HIGH_HZ, 0.7071);
+    let mut mid_lp_b = Biquad::lowpass(sr, XOVER_MID_HIGH_HZ, 0.7071);
 
-    for frame in 0..frames {
-        let start = frame * hop;
-        for (i, slot) in buffer.iter_mut().enumerate() {
-            *slot = Complex32::new(samples[start + i] * window[i] as f32, 0.0);
+    let settle = ((SETTLE_SECONDS * sr) as usize).min(n.saturating_sub(1));
+    for sample in samples.iter().take(settle) {
+        let x = f64::from(*sample);
+        let _ = low_b.process(low_a.process(x));
+        let _ = high_b.process(high_a.process(x));
+        let _ = mid_lp_b.process(mid_lp_a.process(mid_hp_b.process(mid_hp_a.process(x))));
+    }
+
+    let mut all = vec![0.0f64; count];
+    let mut low = vec![0.0f64; count];
+    let mut mid = vec![0.0f64; count];
+    let mut high = vec![0.0f64; count];
+
+    for (index, slot_all) in all.iter_mut().enumerate() {
+        let start = index * step;
+        let end = start + step;
+        let mut peak_all = 0.0f64;
+        let mut peak_low = 0.0f64;
+        let mut peak_mid = 0.0f64;
+        let mut peak_high = 0.0f64;
+        for sample in &samples[start..end] {
+            let x = f64::from(*sample);
+            let y_low = low_b.process(low_a.process(x));
+            let y_high = high_b.process(high_a.process(x));
+            let y_mid =
+                mid_lp_b.process(mid_lp_a.process(mid_hp_b.process(mid_hp_a.process(x))));
+            peak_all = peak_all.max(x.abs());
+            peak_low = peak_low.max(y_low.abs());
+            peak_mid = peak_mid.max(y_mid.abs());
+            peak_high = peak_high.max(y_high.abs());
         }
-        fft.process_with_scratch(&mut buffer, &mut scratch);
-        for (bin, value) in buffer.iter().take(bins).enumerate() {
-            let hz = bin as f64 * sr / n_fft as f64;
-            let band = if hz < XOVER_LOW {
-                0
-            } else if hz < XOVER_HIGH {
-                1
-            } else {
-                2
-            };
-            let magnitude = value.norm() as f64;
-            energies[band][frame] += magnitude * magnitude;
+        *slot_all = peak_all;
+        low[index] = peak_low;
+        mid[index] = peak_mid;
+        high[index] = peak_high;
+    }
+
+    (all, low, mid, high)
+}
+
+/// Transposed Direct Form II 双二阶（RBJ cookbook）。
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl Biquad {
+    fn lowpass(sr: f64, cutoff: f64, q: f64) -> Self {
+        let w0 = std::f64::consts::TAU * (cutoff / sr).clamp(1e-6, 0.49);
+        let cos = w0.cos();
+        let sin = w0.sin();
+        let alpha = sin / (2.0 * q.max(1e-6));
+        let b0 = (1.0 - cos) * 0.5;
+        let b1 = 1.0 - cos;
+        let b2 = (1.0 - cos) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos;
+        let a2 = 1.0 - alpha;
+        Self::normalize(b0, b1, b2, a0, a1, a2)
+    }
+
+    fn highpass(sr: f64, cutoff: f64, q: f64) -> Self {
+        let w0 = std::f64::consts::TAU * (cutoff / sr).clamp(1e-6, 0.49);
+        let cos = w0.cos();
+        let sin = w0.sin();
+        let alpha = sin / (2.0 * q.max(1e-6));
+        let b0 = (1.0 + cos) * 0.5;
+        let b1 = -(1.0 + cos);
+        let b2 = (1.0 + cos) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos;
+        let a2 = 1.0 - alpha;
+        Self::normalize(b0, b1, b2, a0, a1, a2)
+    }
+
+    fn normalize(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Self {
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
         }
     }
-    energies
+
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
 }
 
 #[cfg(test)]
@@ -224,23 +250,20 @@ mod tests {
 
     #[test]
     fn bucket_count_follows_the_integer_division_rule() {
-        // 分格是 `step = max(1, n_frames/buckets)` 再 `count = n_frames/step`
-        //（和 Python 版同一个公式）。两条推论：
-        //  1. 帧数不够时，请求再多格也只能给出帧数那么多列；
-        //  2. 帧数远多于请求格数时，整数除法会让实际列数略多于请求值。
+        // 分格是 `step = max(1, n_samples/buckets)` 再 `count = n_samples/step`。
+        // 样本够多时实际列数接近请求值；不够时按能整除的列数给。
         let sr = WAVEFORM_SR as f64;
-        let frames_of = |seconds: f64| 1 + ((seconds * sr) as usize - N_FFT) / HOP;
+        let samples_of = |seconds: f64| (seconds * sr) as usize;
 
-        // 30 秒 ≈ 937 帧：请求 640 格时 step 被压到 1，只能原样给 937 列
-        let short = band_waveform(&tone(440.0, 30.0, sr), sr, 640);
-        assert_eq!(short.amp.len(), frames_of(30.0), "帧数不足时按帧给");
+        let short = band_waveform(&tone(440.0, 1.0, sr), sr, 640);
+        let expected = samples_of(1.0) / (samples_of(1.0) / 640).max(1);
+        assert_eq!(short.amp.len(), expected);
 
-        // 5 分钟 ≈ 9370 帧：这时才谈得上"接近请求值"
         let long_samples = tone(440.0, 300.0, sr);
         for buckets in [100usize, 300, 640] {
             let wave = band_waveform(&long_samples, sr, buckets);
             assert!(
-                wave.amp.len() >= buckets && wave.amp.len() <= buckets * 12 / 10,
+                wave.amp.len() >= buckets && wave.amp.len() <= buckets + 1,
                 "请求 {buckets} 格，实际 {}",
                 wave.amp.len()
             );
@@ -249,16 +272,13 @@ mod tests {
 
     #[test]
     fn bass_sections_read_redder_than_treble_sections_of_the_same_track() {
-        // 颜色是**相对本曲常态**的偏离量（见模块注释里的方案 C），
-        // 所以单独喂一个纯音是问不出颜色的——每一列的占比都一样，
-        // 除掉常态之后三个通道齐平。要测的是"同一首曲子里段落之间分得开"。
+        // Mixxx 绝对频谱上色：100 Hz 应偏红，5 kHz 应偏蓝。
         let sr = WAVEFORM_SR as f64;
         let mut samples = tone(100.0, 8.0, sr);
         samples.extend(tone(5000.0, 8.0, sr));
 
         let wave = band_waveform(&samples, sr, 200);
         let half = wave.amp.len() / 2;
-        // 各取段落中央，避开交界处的平滑窗
         let bass_at = half / 2;
         let treble_at = half + half / 2;
 
@@ -277,6 +297,21 @@ mod tests {
     }
 
     #[test]
+    fn mid_tone_reads_greener_than_bass_or_treble() {
+        let sr = WAVEFORM_SR as f64;
+        // 1 kHz 落在 600–4000 中频带
+        let wave = band_waveform(&tone(1000.0, 4.0, sr), sr, 100);
+        let i = wave.amp.len() / 2;
+        assert!(
+            wave.g[i] > wave.r[i] && wave.g[i] > wave.b[i],
+            "1 kHz 应偏绿：r={} g={} b={}",
+            wave.r[i],
+            wave.g[i],
+            wave.b[i]
+        );
+    }
+
+    #[test]
     fn amplitudes_stay_inside_the_unit_range() {
         let samples = tone(440.0, 10.0, WAVEFORM_SR as f64);
         let wave = band_waveform(&samples, WAVEFORM_SR as f64, 200);
@@ -285,7 +320,6 @@ mod tests {
 
     #[test]
     fn colour_channels_never_go_fully_black() {
-        // 纯 (255,0,0) 在深色底上太扎眼，暗通道要保留一丝底色
         let samples = tone(100.0, 10.0, WAVEFORM_SR as f64);
         let wave = band_waveform(&samples, WAVEFORM_SR as f64, 200);
         let floor = (COLOR_FLOOR * 255.0).round() as u8;
@@ -296,7 +330,7 @@ mod tests {
 
     #[test]
     fn too_short_input_returns_an_empty_waveform_instead_of_panicking() {
-        let wave = band_waveform(&[0.0; 100], WAVEFORM_SR as f64, 200);
+        let wave = band_waveform(&[0.0; 16], WAVEFORM_SR as f64, 200);
         assert!(wave.amp.is_empty());
     }
 }
